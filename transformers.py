@@ -26,6 +26,7 @@ import tensorflow as tf
 import keras
 import numpy as np
 from typing import Any
+from pydantic.dataclasses import dataclass
 
 
 class TokenAndPositionEmbedding(keras.layers.Layer):
@@ -240,7 +241,9 @@ class PerceiverDecoder(keras.layers.Layer):
 class PadAndTruncate(keras.layers.Layer):
     """
     Pads or truncates the second dimension of a Tensor to shape it to a consistent size
+
     For example:
+    ```
     pt = PadAndTruncate()
     pt(keras.layers.Input(shape=(3,)))
     pt(tf.constant([[1], [2], [3]]))
@@ -254,16 +257,18 @@ class PadAndTruncate(keras.layers.Layer):
        array([[3, 4, 5],
               [4, 5, 6],
               [5, 6, 7]], dtype=int32)>
+    ```
     """
-    def __init__(self, pad_with: Any=None) -> None:
+    def __init__(self, size: int=None, pad_with: Any=None) -> None:
         super().__init__()
-        self._input_shape = None
+        self._input_shape = size
         self._pad_with = pad_with
         if self._pad_with is None:
             self._pad_with = 0
     
     def build(self, input_shape):
-        self._input_shape = input_shape
+        if self._input_shape is None:
+            self._input_shape = input_shape
     
     def call(self, inputs: tf.Tensor, *args, **kwargs) -> tf.Tensor:
         if inputs.shape[1] < self._input_shape[1]:
@@ -294,3 +299,44 @@ def generate_batches(data: np.array, context_length: int, batch_size: int, shuff
         values = data[batch_indices]
         targets = data[batch_indices+1]
         yield values, targets
+
+
+class InverseTokenEmbedding(keras.layers.Layer):
+    """Inverse token embedding"""
+    def __init__(self, tok_embedding: keras.layers.Embedding) -> None:
+        super().__init__()
+        self._tok_embedding = tok_embedding
+
+    def call(self, inputs: tf.Tensor) -> tf.Tensor:
+        return tf.matmul(inputs, self._tok_embedding.weights[0], transpose_b=True)
+
+
+@dataclass
+class GPTConfig:
+    vocab_size: int
+    context: int
+    head_size: int
+    num_heads: int
+    num_layers: int
+    dropout: float
+
+
+class GPT(keras.layers.Layer):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.config = config
+        self._tok_embedding = keras.layers.Embedding(config.vocab_size, config.num_heads*config.head_size)
+        self._pos_embedding = keras.layers.Embedding(config.context, config.num_heads*config.head_size)
+        self._transformers = keras.Sequential([TransformerDecoder(config.num_heads,
+                                                                  config.head_size,
+                                                                  dropout=config.dropout)]*config.num_layers)
+        self._layer_norm = keras.layers.LayerNormalization()
+        self._inv_tok_embedding = InverseTokenEmbedding(self._tok_embedding)
+        self._positions = tf.range(config.context)
+
+    def call(self, inputs: tf.Tensor) -> tf.Tensor:
+        layer = self._tok_embedding(inputs) + self._pos_embedding(self._positions)
+        layer = self._transformers(layer)
+        layer = self._layer_norm(layer)
+        layer = self._inv_tok_embedding(layer)
+        return layer
